@@ -61,10 +61,28 @@ patient_count == 0
  ### sample patients need to be created/imported for audit and demo workflows
 
 
-## Stage 2 - Production
+## Demo deployment
 Google Compute Engine VM, install Docker, and run OpenEMR using the official production Docker Compose pattern. 
 OpenEMR’s official Docker image supports automated installation/configuration and requires a companion MySQL/MariaDB container. 
 OpenEMR’s own installation guide also points to the official Docker image as the modern plug-and-play Docker option
+
+
+My OpenEMR is deployed on a Google Compute Engine VM using Docker Compose.
+
+- OpenEMR runs in a Docker container.
+- MariaDB runs in a Docker container.
+- Caddy provides HTTPS reverse proxy.
+- The demo uses an sslip.io hostname mapped to the VM static IP.
+- Persistent Docker data is stored on a GCE persistent disk.
+- This environment is for synthetic patient data only.
+
+Demo URL:
+
+https://openemr.136-118-242-198.sslip.io
+
+## Data policy
+This environment is for synthetic patient data only.
+This is not a HIPAA-ready production deployment.
 
 ### Shape
 - Google Compute Engine VM
@@ -94,10 +112,14 @@ gcloud compute addresses describe openemr-ip \
   --region=$REGION \
   --format="get(address)"
 
-136.118.242.198
-openemr.136-118-242-198.sslip.io
-Copy that IP. You will point your demo domain to it, for example:
-  openemr.yourdomain.com  A  <STATIC_IP>
+ 136.118.242.198
+
+that IP can point to demo domain to it, for example:
+  openemr.yourdomain.com  A  <STATIC_IP> 
+
+  or  use 
+  openemr.136-118-242-198.sslip.io
+
 
 ##### create the VM
 gcloud compute instances create $VM_NAME \
@@ -314,14 +336,13 @@ Paste:
     reverse_proxy openemr:80
 }
 
-That is enough for the MVP.
 
 8. Start the stack
 docker compose pull
 docker compose up -d
 
 
-Check status:
+##### Check status:
 
 docker compose ps
 
@@ -331,11 +352,211 @@ docker compose logs -f caddy
 docker compose logs -f openemr
 docker compose logs -f mariadb
 
-Once Caddy gets its certificate, visit:
+##### Once Caddy gets its certificate, visit:
 
 https://openemr.yourdomain.com
+https://openemr.136-118-242-198.sslip.io/ 
 
 Login with:
 
 Username: value of OE_USER
 Password: value of OE_PASS
+
+
+
+
+validation steps
+
+cd /srv/openemr/app
+docker compose ps
+
+### test persistence:
+
+docker compose restart
+  --> Log back in and confirm OpenEMR still loads.
+
+Create test patient:
+
+Name: Alex Fake
+DOB: 2000-01-01
+
+restart again -- > docker compose restart
+--> Confirm the patient is still there.
+
+##### Useful maintenance commands
+cd /srv/openemr/app
+
+docker compose ps
+docker compose logs -f openemr
+docker compose logs -f caddy
+docker compose logs -f mariadb
+docker compose restart
+
+
+
+##### Backup database:
+
+source .env
+
+mkdir -p /srv/openemr/backups
+
+docker compose exec mariadb mariadb-dump \
+  -u root \
+  -p${MYSQL_ROOT_PASSWORD} \
+  openemr > /srv/openemr/backups/openemr-db-$(date +%Y%m%d-%H%M%S).sql
+
+
+
+
+#### update image
+Google Artifact Registry is the right place to push images for GCP. Image paths look like us-west1-docker.pkg.dev/PROJECT_ID/REPO_NAME/IMAGE_NAME:TAG, and Docker Compose will recreate containers when the image or config changes while preserving mounted volumes.
+
+1. Create an Artifact Registry repo
+
+From your local machine:
+
+export PROJECT_ID="your-gcp-project-id"
+export REGION="us-west1"
+export REPO="openemr-images"
+
+gcloud config set project $PROJECT_ID
+
+gcloud services enable artifactregistry.googleapis.com
+
+gcloud artifacts repositories create $REPO \
+  --repository-format=docker \
+  --location=$REGION \
+  --description="Docker images for OpenEMR demo"
+
+Configure Docker auth:
+
+gcloud auth configure-docker ${REGION}-docker.pkg.dev
+
+Artifact Registry requires the repo to exist before pushing, and the pushing account needs Artifact Registry Writer access. The VM or runtime account pulling the image needs Artifact Registry Reader access.
+
+2. Build and push the image
+
+From your codebase:
+
+export TAG=$(git rev-parse --short HEAD)
+export IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO}/openemr:${TAG}"
+
+docker build -t $IMAGE .
+docker push $IMAGE
+
+Example image:
+
+us-west1-docker.pkg.dev/my-project/openemr-images/openemr:a1b2c3d
+
+If you are just updating to a different official OpenEMR image, you can skip building/pushing and simply change the image tag in docker-compose.yml, for example:
+
+image: openemr/openemr:7.0.4.0
+
+to:
+
+image: openemr/openemr:8.0.0.3
+
+But for your own modified image, use Artifact Registry.
+
+3. Give the VM permission to pull
+
+Find the VM service account:
+
+gcloud compute instances describe openemr-demo \
+  --zone=us-west1-a \
+  --format="get(serviceAccounts.email)"
+
+Grant Artifact Registry Reader:
+
+export VM_SERVICE_ACCOUNT="your-vm-service-account@your-project.iam.gserviceaccount.com"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${VM_SERVICE_ACCOUNT}" \
+  --role="roles/artifactregistry.reader"
+
+SSH into the VM and configure Docker auth:
+
+gcloud compute ssh openemr-demo --zone=us-west1-a
+
+gcloud auth configure-docker us-west1-docker.pkg.dev
+4. Backup before deploying
+
+On the VM:
+
+cd /srv/openemr/app
+source .env
+
+mkdir -p /srv/openemr/backups
+
+docker compose exec mariadb mariadb-dump \
+  -u root \
+  -p"$MYSQL_ROOT_PASSWORD" \
+  "$MYSQL_DATABASE" > /srv/openemr/backups/pre-deploy-$(date +%Y%m%d-%H%M%S).sql
+
+For your synthetic-only demo this is enough.
+
+5. Update docker-compose.yml
+
+On the VM:
+
+cd /srv/openemr/app
+nano docker-compose.yml
+
+Change the openemr image from:
+
+image: openemr/openemr:7.0.4.0
+
+to your pushed image:
+
+image: us-west1-docker.pkg.dev/YOUR_PROJECT_ID/openemr-images/openemr:a1b2c3d
+
+Then deploy:
+
+docker compose pull openemr
+docker compose up -d openemr
+docker compose ps
+
+docker compose pull pulls service images, and docker compose up -d starts/recreates the changed service in detached mode.
+
+6. Verify
+docker compose ps
+docker compose logs --tail=100 openemr
+
+Test internally:
+
+docker exec openemr-app curl -i http://localhost
+
+Expected:
+
+HTTP/1.1 302 Found
+Location: interface/login/login.php?site=default
+
+Test public URL:
+
+source .env
+curl -Ik https://$DOMAIN
+
+Then open:
+
+https://openemr.136-118-242-198.sslip.io
+
+
+7. Rollback
+
+Before deploying, write down the previous image:
+
+grep "image:" docker-compose.yml
+
+Rollback is just changing the image tag back:
+
+image: openemr/openemr:7.0.4.0
+
+or to the prior Artifact Registry tag:
+
+image: us-west1-docker.pkg.dev/YOUR_PROJECT_ID/openemr-images/openemr:previous-good-sha
+
+Then:
+
+docker compose pull openemr
+docker compose up -d openemr
+docker compose logs --tail=100 openemr

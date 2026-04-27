@@ -4,6 +4,10 @@
 # environment vars
 .env
 
+.claude
+.codex
+AGENTS.md
+
 # vendor and assets
 node_modules
 /vendor/*
